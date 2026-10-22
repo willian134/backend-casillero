@@ -25,7 +25,7 @@ let cards = [
   { 
     id: 'C82F0059', 
     owner: 'María Gómez', 
-    isPaid: false, // Morosa por defecto -> SERVO EN 0°
+    isPaid: false, // Morosa por defecto
     active: true, 
     cardCode: 'CARD_EXPIRED_02' 
   },
@@ -56,47 +56,33 @@ const addLog = (type, message, cardId = null, user = 'Sistema') => {
   return log;
 };
 
-// ==========================================
-// ENDPOINT WEBHOOK (ESP32)
-// ==========================================
+// --- ENDPOINT WEBHOOK RECEPTOR RFID ---
 app.post('/api/webhook', (req, res) => {
   const { event, tipo_evento, cardId, uid, valor } = req.body;
   const rawUid = cardId || uid || valor || '';
   const idTarjeta = rawUid.toString().toUpperCase().trim();
   const eventType = event || tipo_evento;
 
-  // 🚨 1. EVENTO DE FORCEJEO / VIBRACIÓN (SENSOR SW-420)
-  if (eventType === 'DOOR_FORCED') {
-    console.log("🚨 [ALERTA DE SEGURIDAD] Forcejeo detectado en la puerta por el SW-420");
-    
-    addLog('DANGER', '¡ALERTA DE SEGURIDAD! Vibración / Forcejeo detectado en la puerta', null, 'Sensor SW-420');
-    
-    // Activa la bandera de vibración en vivo hacia el Frontend React
-    io.emit('telemetry_update', { vibration: true });
-
-    return res.json({ action: 'ALARM_ACKNOWLEDGED', buzzer: true });
-  }
-
-  // 💳 2. EVENTO DE ESCANEO RFID
   if (eventType === 'RFID_SCAN' || eventType === 'rfid_lectura') {
+    // Buscar la tarjeta comparando en mayúsculas
     const card = cards.find(c => c.id.toUpperCase().trim() === idTarjeta);
 
     console.log(`[ESCANEO REAL] UID: ${idTarjeta} | Socio: ${card ? card.owner : 'Desconocido'}`);
 
-    // Emitir escaneo a React
+    // Emitir Socket al Frontend React
     io.emit('card_scanned', {
       uid: idTarjeta,
       cardCode: card ? card.cardCode : `UID_${idTarjeta}`,
       userName: card ? card.owner : 'Desconocido'
     });
 
-    // ⛔ REGLA DE BLOQUEO A: TARJETA NO REGISTRADA
+    // ⛔ REGLA DE BLOQUEO 1: TARJETA NO REGISTRADA
     if (!card) {
       addLog('ACCESS_DENIED', `Tarjeta no registrada: ${idTarjeta}`, idTarjeta);
       return res.json({ action: 'DENY', reason: 'CARD_NOT_FOUND', servoAngle: 0, buzzer: true });
     }
 
-    // ⛔ REGLA DE BLOQUEO B: SOCIO MOROSO O TARJETA DESACTIVADA
+    // ⛔ REGLA DE BLOQUEO 2: SOCIO MOROSO O TARJETA DESACTIVADA
     if (!card.active || !card.isPaid) {
       const motivo = !card.active ? 'Tarjeta Inactiva' : 'Membresía Morosa';
       addLog('ACCESS_DENIED', `Acceso denegado a ${card.owner} (${motivo})`, idTarjeta, card.owner);
@@ -105,11 +91,11 @@ app.post('/api/webhook', (req, res) => {
       lockerState.servoAngle = 0;
       io.emit('update_locker', lockerState);
 
-      // RETORNA STRICTAMENTE DENY PARA QUE EL ESP32 MANTENGA EL SERVO A 0°
+      // RETORNA STRICTAMENTE DENY PARA QUE EL ESP32 MANTENGA EL SERVO EN 0°
       return res.json({ action: 'DENY', reason: 'DENIED_STATUS', servoAngle: 0, buzzer: true });
     }
 
-    // ✅ CASO AUTORIZADO: SOCIO AL DÍA Y ACTIVO
+    // ✅ CASO ÚNICO AUTORIZADO: SOCIO AL DÍA Y ACTIVO
     addLog('ACCESS_GRANTED', `Acceso concedido a ${card.owner}`, idTarjeta, card.owner);
     lockerState.isOpen = true;
     lockerState.servoAngle = 90;
@@ -127,30 +113,10 @@ app.post('/api/webhook', (req, res) => {
   res.status(400).json({ error: 'Evento Webhook no reconocido' });
 });
 
-// ==========================================
-// RUTAS API REST PARA EL DASHBOARD
-// ==========================================
+// RUTAS API REST SINCRONIZADAS
 app.get('/api/cards', (req, res) => res.json(cards));
 
-// AGREGAR / EDITAR SOCIO
-app.post('/api/cards', (req, res) => {
-  const { id, owner } = req.body;
-  if (!id || !owner) return res.status(400).json({ error: 'Faltan datos' });
-
-  const cleanId = id.toUpperCase().trim();
-  const existingCard = cards.find(c => c.id.toUpperCase().trim() === cleanId);
-
-  if (existingCard) {
-    existingCard.owner = owner;
-  } else {
-    cards.push({ id: cleanId, owner, isPaid: true, active: true, cardCode: `CARD_${cleanId.substring(0, 4)}` });
-  }
-
-  io.emit('update_cards', cards);
-  res.json({ success: true, cards });
-});
-
-// ACTUALIZAR ESTADO DE PAGO / MOROSIDAD
+// CAMBIAR PAGO / MOROSIDAD
 app.put('/api/cards/:id/membership', (req, res) => {
   const { id } = req.params;
   const { isPaid } = req.body;
@@ -163,7 +129,7 @@ app.put('/api/cards/:id/membership', (req, res) => {
   res.json({ success: true, cards });
 });
 
-// ACTUALIZAR ESTADO ACTIVO / DESACTIVADO
+// CAMBIAR ESTADO ACTIVO / INACTIVO
 app.put('/api/cards/:id', (req, res) => {
   const { id } = req.params;
   const { active } = req.body;
@@ -177,4 +143,4 @@ app.put('/api/cards/:id', (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`🚀 Servidor backend listo en el puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor backend en puerto ${PORT}`));
