@@ -13,7 +13,13 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-let cards = [];
+// SOCIOS POR DEFECTO PARA QUE LA PANTALLA NO QUEDE VACÍA AL INICIAR
+let cards = [
+  { id: 'B943AA14', owner: 'Carlos Pérez', isPaid: true, active: true, cardCode: 'CARD_VIP_01' },
+  { id: 'E5F6G7H8', owner: 'María Gómez', isPaid: false, active: true, cardCode: 'CARD_EXPIRED_02' },
+  { id: 'I9J0K1L2', owner: 'Juan Rodríguez', isPaid: true, active: false, cardCode: 'CARD_LOST_03' }
+];
+
 let lockerState = {
   isOpen: false,
   isAlarm: false,
@@ -24,7 +30,7 @@ let lockerState = {
 
 let isEsp32Connected = false;
 let lastEsp32Ping = null;
-let currentVoltage = 0.0; // Estado real de voltaje
+let currentVoltage = 5.0;
 let auditLogs = [];
 
 const addLog = (type, message, cardId = null, user = 'Sistema') => {
@@ -34,10 +40,12 @@ const addLog = (type, message, cardId = null, user = 'Sistema') => {
     message,
     cardId,
     user,
-    timestamp: new Date().toLocaleTimeString()
+    timestamp: new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   };
   auditLogs.unshift(log);
   if (auditLogs.length > 50) auditLogs.pop();
+  
+  // Emitir evento de log a la pantalla
   io.emit('new_log', log);
   return log;
 };
@@ -47,9 +55,10 @@ setInterval(() => {
   if (lastEsp32Ping && (Date.now() - lastEsp32Ping > 8000)) {
     if (isEsp32Connected) {
       isEsp32Connected = false;
-      currentVoltage = 0.0; // Al desconectarse vuelve a 0V
+      currentVoltage = 0.0;
       addLog('WARNING', 'ESP32 fuera de línea / Alimentación cortada');
-      io.emit('hardware_status', { connected: false, voltage: 0.0 });
+      
+      io.emit('telemetry_update', { connected: false, voltage: 0.0 });
     }
   }
 }, 3000);
@@ -61,14 +70,22 @@ app.post('/api/cards', (req, res) => {
   const { id, owner } = req.body;
   if (!id || !owner) return res.status(400).json({ error: 'Faltan datos requeridos' });
 
-  const existingCard = cards.find(c => c.id === id);
+  const cleanId = id.toUpperCase();
+  const existingCard = cards.find(c => c.id === cleanId);
+  
   if (existingCard) {
     existingCard.owner = owner;
   } else {
-    cards.push({ id, owner, isPaid: true, active: true });
+    cards.push({ 
+      id: cleanId, 
+      owner, 
+      isPaid: true, 
+      active: true, 
+      cardCode: `CARD_${cleanId.substring(0, 4)}` 
+    });
   }
 
-  addLog('INFO', `Socio/Tarjeta registrado(a): ${owner} (${id})`, id, owner);
+  addLog('INFO', `Socio/Tarjeta registrado(a): ${owner} (${cleanId})`, cleanId, owner);
   io.emit('update_cards', cards);
   res.json({ success: true, cards });
 });
@@ -110,15 +127,19 @@ app.post('/api/locker/reset-alarm', (req, res) => {
 
 // --- ENDPOINT WEBHOOK RECEPTOR DEL ESP32 ---
 app.post('/api/webhook', (req, res) => {
-  const { event, cardId, forced, objectDetected, voltage } = req.body;
+  const { event, tipo_evento, cardId, uid, forced, objectDetected, distance, voltage } = req.body;
 
   lastEsp32Ping = Date.now();
 
-  // Actualizar lectura de voltaje en tiempo real si viene en el payload
+  // Compatibilidad de parámetros recibidos desde el ESP32
+  const eventType = event || tipo_evento;
+  const idTarjeta = (cardId || uid || '').toUpperCase();
+
+  // Lectura de Voltaje
   if (voltage !== undefined && voltage !== null) {
     currentVoltage = parseFloat(voltage);
   } else if (!isEsp32Connected) {
-    currentVoltage = 5.0; // Valor nominal de respaldo si está recién conectado
+    currentVoltage = 5.0;
   }
 
   if (!isEsp32Connected) {
@@ -126,43 +147,54 @@ app.post('/api/webhook', (req, res) => {
     addLog('INFO', `Hardware ESP32 enlazado (${currentVoltage.toFixed(1)}V)`);
   }
 
-  // Transmitir telemetría en tiempo real
-  io.emit('hardware_status', { connected: true, voltage: currentVoltage });
+  // Transmitir Telemetría compatible hacia el Frontend
+  io.emit('telemetry_update', { 
+    connected: true, 
+    voltage: currentVoltage,
+    distance: distance !== undefined ? distance : (objectDetected ? 10 : 25),
+    vibration: forced || false
+  });
 
-  if (event === 'PING') {
+  if (eventType === 'PING') {
     return res.json({ status: 'PONG', connected: true, voltage: currentVoltage });
   }
 
-  // Lectura Real de Tarjeta RFID (RC522)
-  if (event === 'RFID_SCAN') {
-    const card = cards.find(c => c.id === cardId);
+  // 1. LECTURA REAL DE TARJETA RFID (RC522)
+  if (eventType === 'RFID_SCAN' || eventType === 'rfid_lectura') {
+    const card = cards.find(c => c.id === idTarjeta);
+
+    // ⚡ CLAVE: TRANSMITIR EVENTO AL FRONTEND REACT EN TIEMPO REAL
+    io.emit('card_scanned', {
+      uid: idTarjeta,
+      cardCode: card ? card.cardCode : `UID_${idTarjeta}`,
+      userName: card ? card.owner : 'Desconocido'
+    });
 
     if (!card) {
-      addLog('ACCESS_DENIED', `Tarjeta física desconocida escaneada: ${cardId}`, cardId);
+      addLog('ACCESS_DENIED', `Tarjeta física desconocida escaneada: ${idTarjeta}`, idTarjeta);
       lockerState.isAlarm = true;
       io.emit('update_locker', lockerState);
+      io.emit('unknown_card_scanned', { cardId: idTarjeta });
 
-      // Abrir modal flotante en React
-      io.emit('unknown_card_scanned', { cardId });
-
-      return res.json({ action: 'DENY', reason: 'CARD_NOT_FOUND', cardId, buzzer: true });
+      return res.json({ action: 'DENY', reason: 'CARD_NOT_FOUND', cardId: idTarjeta, buzzer: true });
     }
 
     if (!card.active) {
-      addLog('ACCESS_DENIED', `Acceso denegado: Tarjeta inactiva (${card.owner})`, cardId, card.owner);
+      addLog('ACCESS_DENIED', `Acceso denegado: Tarjeta inactiva (${card.owner})`, idTarjeta, card.owner);
       return res.json({ action: 'DENY', reason: 'CARD_INACTIVE', buzzer: true });
     }
 
     if (!card.isPaid) {
-      addLog('ACCESS_DENIED', `Acceso denegado: Membresía morosa (${card.owner})`, cardId, card.owner);
+      addLog('ACCESS_DENIED', `Acceso denegado: Membresía morosa (${card.owner})`, idTarjeta, card.owner);
       return res.json({ action: 'DENY', reason: 'MEMBERSHIP_EXPIRED', buzzer: true });
     }
 
+    // ACCESO CONCEDIDO (Apertura por 4 Segundos)
     lockerState.isOpen = true;
     lockerState.servoAngle = 90;
-    lockerState.lastCardScanned = cardId;
+    lockerState.lastCardScanned = idTarjeta;
     
-    addLog('ACCESS_GRANTED', `Acceso concedido a ${card.owner}`, cardId, card.owner);
+    addLog('ACCESS_GRANTED', `Acceso concedido a ${card.owner}`, idTarjeta, card.owner);
     io.emit('update_locker', lockerState);
 
     setTimeout(() => {
@@ -174,16 +206,19 @@ app.post('/api/webhook', (req, res) => {
     return res.json({ action: 'ALLOW', servoAngle: 90, buzzer: false });
   }
 
-  // Sensor SW-420
-  if (event === 'DOOR_FORCED' || forced === true) {
+  // 2. SENSOR DE IMPACTO / VIBRACIÓN SW-420
+  if (eventType === 'DOOR_FORCED' || eventType === 'vibracion_alerta' || forced === true) {
     lockerState.isAlarm = true;
     addLog('FORCED_ALARM', '¡ALERTA FÍSICA! Vibración/Forzado detectado por sensor SW-420');
+    
     io.emit('update_locker', lockerState);
+    io.emit('telemetry_update', { vibration: true });
+
     return res.json({ action: 'TRIGGER_ALARM', buzzer: true });
   }
 
-  // Sensor HC-SR04
-  if (event === 'OBJECT_STATUS') {
+  // 3. SENSOR ULTRASÓNICO HC-SR04
+  if (eventType === 'OBJECT_STATUS') {
     lockerState.forgottenObjects = objectDetected;
     if (objectDetected) {
       addLog('WARNING', 'Sensor HC-SR04 reportó pertenencia dentro del casillero');
@@ -200,10 +235,10 @@ app.post('/api/webhook', (req, res) => {
 io.on('connection', (socket) => {
   socket.emit('update_locker', lockerState);
   socket.emit('update_cards', cards);
-  socket.emit('hardware_status', { connected: isEsp32Connected, voltage: currentVoltage });
+  socket.emit('telemetry_update', { connected: isEsp32Connected, voltage: currentVoltage });
 });
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`🚀 Servidor Real IoT corriendo en: http://localhost:${PORT}`);
+  console.log(`🚀 Servidor IoT en tiempo real ejecutándose en puerto: ${PORT}`);
 });
