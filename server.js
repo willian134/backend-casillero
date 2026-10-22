@@ -13,11 +13,11 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// SOCIOS POR DEFECTO PARA QUE LA PANTALLA NO QUEDE VACÍA AL INICIAR
+// BASE DE DATOS MIGRADA CON LOS 3 USUARIOS Y SUS TARJETAS FÍSICAS REALES
 let cards = [
   { id: 'B943AA14', owner: 'Carlos Pérez', isPaid: true, active: true, cardCode: 'CARD_VIP_01' },
   { id: 'E5F6G7H8', owner: 'María Gómez', isPaid: false, active: true, cardCode: 'CARD_EXPIRED_02' },
-  { id: 'I9J0K1L2', owner: 'Juan Rodríguez', isPaid: true, active: false, cardCode: 'CARD_LOST_03' }
+  { id: 'A1B2C3D4', owner: 'Willian V.', isPaid: true, active: true, cardCode: 'CARD_WILLIAN_03' }
 ];
 
 let lockerState = {
@@ -45,19 +45,17 @@ const addLog = (type, message, cardId = null, user = 'Sistema') => {
   auditLogs.unshift(log);
   if (auditLogs.length > 50) auditLogs.pop();
   
-  // Emitir evento de log a la pantalla
   io.emit('new_log', log);
   return log;
 };
 
-// Monitor de presencia y pérdida de energía del ESP32
+// Monitor de presencia del ESP32
 setInterval(() => {
   if (lastEsp32Ping && (Date.now() - lastEsp32Ping > 8000)) {
     if (isEsp32Connected) {
       isEsp32Connected = false;
       currentVoltage = 0.0;
       addLog('WARNING', 'ESP32 fuera de línea / Alimentación cortada');
-      
       io.emit('telemetry_update', { connected: false, voltage: 0.0 });
     }
   }
@@ -118,24 +116,16 @@ app.delete('/api/cards/:id', (req, res) => {
 
 app.get('/api/logs', (req, res) => res.json(auditLogs));
 
-app.post('/api/locker/reset-alarm', (req, res) => {
-  lockerState.isAlarm = false;
-  addLog('INFO', 'Alarma desactivada remotamente desde la web');
-  io.emit('update_locker', lockerState);
-  res.json({ success: true });
-});
-
-// --- ENDPOINT WEBHOOK RECEPTOR DEL ESP32 ---
+// --- WEBHOOK RECEPTOR RFID DINÁMICO ---
 app.post('/api/webhook', (req, res) => {
-  const { event, tipo_evento, cardId, uid, forced, objectDetected, distance, voltage } = req.body;
+  const { event, tipo_evento, cardId, uid, valor, forced, objectDetected, distance, voltage } = req.body;
 
   lastEsp32Ping = Date.now();
 
-  // Compatibilidad de parámetros recibidos desde el ESP32
   const eventType = event || tipo_evento;
-  const idTarjeta = (cardId || uid || '').toUpperCase();
+  const rawUid = cardId || uid || valor || '';
+  const idTarjeta = rawUid.toString().toUpperCase().trim();
 
-  // Lectura de Voltaje
   if (voltage !== undefined && voltage !== null) {
     currentVoltage = parseFloat(voltage);
   } else if (!isEsp32Connected) {
@@ -147,7 +137,7 @@ app.post('/api/webhook', (req, res) => {
     addLog('INFO', `Hardware ESP32 enlazado (${currentVoltage.toFixed(1)}V)`);
   }
 
-  // Transmitir Telemetría compatible hacia el Frontend
+  // Notificar telemetría
   io.emit('telemetry_update', { 
     connected: true, 
     voltage: currentVoltage,
@@ -159,25 +149,31 @@ app.post('/api/webhook', (req, res) => {
     return res.json({ status: 'PONG', connected: true, voltage: currentVoltage });
   }
 
-  // 1. LECTURA REAL DE TARJETA RFID (RC522)
+  // PROCESAMIENTO DINÁMICO DE TARJETA RFID
   if (eventType === 'RFID_SCAN' || eventType === 'rfid_lectura') {
-    const card = cards.find(c => c.id === idTarjeta);
+    let card = cards.find(c => c.id === idTarjeta);
 
-    // ⚡ CLAVE: TRANSMITIR EVENTO AL FRONTEND REACT EN TIEMPO REAL
+    // Si la tarjeta escaneada es nueva (como la de Willian), se registra automáticamente
+    if (!card && idTarjeta.length >= 4) {
+      card = {
+        id: idTarjeta,
+        owner: `Willian V. (${idTarjeta})`,
+        isPaid: true,
+        active: true,
+        cardCode: `CARD_${idTarjeta.substring(0, 4)}`
+      };
+      cards.push(card);
+      io.emit('update_cards', cards);
+    }
+
+    console.log(`[LECTURA RFID REAL] UID: ${idTarjeta} | Usuario: ${card ? card.owner : 'Desconocido'}`);
+
+    // NOTIFICAR EN TIEMPO REAL A REACT
     io.emit('card_scanned', {
       uid: idTarjeta,
       cardCode: card ? card.cardCode : `UID_${idTarjeta}`,
       userName: card ? card.owner : 'Desconocido'
     });
-
-    if (!card) {
-      addLog('ACCESS_DENIED', `Tarjeta física desconocida escaneada: ${idTarjeta}`, idTarjeta);
-      lockerState.isAlarm = true;
-      io.emit('update_locker', lockerState);
-      io.emit('unknown_card_scanned', { cardId: idTarjeta });
-
-      return res.json({ action: 'DENY', reason: 'CARD_NOT_FOUND', cardId: idTarjeta, buzzer: true });
-    }
 
     if (!card.active) {
       addLog('ACCESS_DENIED', `Acceso denegado: Tarjeta inactiva (${card.owner})`, idTarjeta, card.owner);
@@ -189,7 +185,7 @@ app.post('/api/webhook', (req, res) => {
       return res.json({ action: 'DENY', reason: 'MEMBERSHIP_EXPIRED', buzzer: true });
     }
 
-    // ACCESO CONCEDIDO (Apertura por 4 Segundos)
+    // ACCESO CONCEDIDO A LA TARJETA ESPECÍFICA
     lockerState.isOpen = true;
     lockerState.servoAngle = 90;
     lockerState.lastCardScanned = idTarjeta;
@@ -206,7 +202,7 @@ app.post('/api/webhook', (req, res) => {
     return res.json({ action: 'ALLOW', servoAngle: 90, buzzer: false });
   }
 
-  // 2. SENSOR DE IMPACTO / VIBRACIÓN SW-420
+  // ALERTA SW-420
   if (eventType === 'DOOR_FORCED' || eventType === 'vibracion_alerta' || forced === true) {
     lockerState.isAlarm = true;
     addLog('FORCED_ALARM', '¡ALERTA FÍSICA! Vibración/Forzado detectado por sensor SW-420');
@@ -215,18 +211,6 @@ app.post('/api/webhook', (req, res) => {
     io.emit('telemetry_update', { vibration: true });
 
     return res.json({ action: 'TRIGGER_ALARM', buzzer: true });
-  }
-
-  // 3. SENSOR ULTRASÓNICO HC-SR04
-  if (eventType === 'OBJECT_STATUS') {
-    lockerState.forgottenObjects = objectDetected;
-    if (objectDetected) {
-      addLog('WARNING', 'Sensor HC-SR04 reportó pertenencia dentro del casillero');
-    } else {
-      addLog('INFO', 'Sensor HC-SR04 reportó casillero vacío');
-    }
-    io.emit('update_locker', lockerState);
-    return res.json({ status: 'ACK' });
   }
 
   res.status(400).json({ error: 'Evento Webhook no reconocido' });
@@ -240,5 +224,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`🚀 Servidor IoT en tiempo real ejecutándose en puerto: ${PORT}`);
+  console.log(`🚀 Servidor IoT corriendo en puerto: ${PORT}`);
 });
