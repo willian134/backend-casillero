@@ -13,7 +13,7 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// BASE DE DATOS MIGRADA CON LOS UIDS FÍSICOS REALES DETECTADOS
+// BASE DE DATOS MIGRADA CON LOS 3 UIDS FÍSICOS REALES
 let cards = [
   { 
     id: 'B943AA14', 
@@ -25,14 +25,14 @@ let cards = [
   { 
     id: 'C82F0059', 
     owner: 'María Gómez', 
-    isPaid: false, // MOROSA -> ACCESO DENEGADO (SERVO CERRADO EN 0°)
+    isPaid: false, // Morosa por defecto
     active: true, 
     cardCode: 'CARD_EXPIRED_02' 
   },
   { 
     id: '738F1492', 
     owner: 'Willian V.', 
-    isPaid: true, // AL DÍA -> ACCESO CONCEDIDO (SERVO ABRE A 90°)
+    isPaid: true, 
     active: true, 
     cardCode: 'CARD_WILLIAN_03' 
   }
@@ -56,7 +56,7 @@ const addLog = (type, message, cardId = null, user = 'Sistema') => {
   return log;
 };
 
-// --- WEBHOOK RECEPTOR RFID DINÁMICO ---
+// --- ENDPOINT WEBHOOK RECEPTOR RFID ---
 app.post('/api/webhook', (req, res) => {
   const { event, tipo_evento, cardId, uid, valor } = req.body;
   const rawUid = cardId || uid || valor || '';
@@ -64,34 +64,38 @@ app.post('/api/webhook', (req, res) => {
   const eventType = event || tipo_evento;
 
   if (eventType === 'RFID_SCAN' || eventType === 'rfid_lectura') {
-    const card = cards.find(c => c.id.toUpperCase() === idTarjeta);
+    // Buscar la tarjeta comparando en mayúsculas
+    const card = cards.find(c => c.id.toUpperCase().trim() === idTarjeta);
 
-    console.log(`[LECTURA RFID REAL] UID: ${idTarjeta} | Socio: ${card ? card.owner : 'Desconocido'}`);
+    console.log(`[ESCANEO REAL] UID: ${idTarjeta} | Socio: ${card ? card.owner : 'Desconocido'}`);
 
-    // NOTIFICAR EN TIEMPO REAL A REACT VÍA SOCKETS
+    // Emitir Socket al Frontend React
     io.emit('card_scanned', {
       uid: idTarjeta,
       cardCode: card ? card.cardCode : `UID_${idTarjeta}`,
       userName: card ? card.owner : 'Desconocido'
     });
 
-    // ⛔ CASO 1: TARJETA NO REGISTRADA -> SERVO EN 0°
+    // ⛔ REGLA DE BLOQUEO 1: TARJETA NO REGISTRADA
     if (!card) {
       addLog('ACCESS_DENIED', `Tarjeta no registrada: ${idTarjeta}`, idTarjeta);
       return res.json({ action: 'DENY', reason: 'CARD_NOT_FOUND', servoAngle: 0, buzzer: true });
     }
 
-    // ⛔ CASO 2: SOCIO MOROSO O TARJETA INACTIVA -> SERVO EN 0° (BLOQUEADO)
+    // ⛔ REGLA DE BLOQUEO 2: SOCIO MOROSO O TARJETA DESACTIVADA
     if (!card.active || !card.isPaid) {
-      addLog('ACCESS_DENIED', `Acceso denegado a ${card.owner} (Moroso/Inactivo)`, idTarjeta, card.owner);
+      const motivo = !card.active ? 'Tarjeta Inactiva' : 'Membresía Morosa';
+      addLog('ACCESS_DENIED', `Acceso denegado a ${card.owner} (${motivo})`, idTarjeta, card.owner);
+      
       lockerState.isOpen = false;
       lockerState.servoAngle = 0;
       io.emit('update_locker', lockerState);
 
-      return res.json({ action: 'DENY', reason: 'MEMBERSHIP_EXPIRED', servoAngle: 0, buzzer: true });
+      // RETORNA STRICTAMENTE DENY PARA QUE EL ESP32 MANTENGA EL SERVO EN 0°
+      return res.json({ action: 'DENY', reason: 'DENIED_STATUS', servoAngle: 0, buzzer: true });
     }
 
-    // ✅ CASO 3: SOCIO AUTORIZADO -> SERVO A 90°
+    // ✅ CASO ÚNICO AUTORIZADO: SOCIO AL DÍA Y ACTIVO
     addLog('ACCESS_GRANTED', `Acceso concedido a ${card.owner}`, idTarjeta, card.owner);
     lockerState.isOpen = true;
     lockerState.servoAngle = 90;
@@ -109,41 +113,34 @@ app.post('/api/webhook', (req, res) => {
   res.status(400).json({ error: 'Evento Webhook no reconocido' });
 });
 
-// RUTAS API REST PARA GESTIÓN DESDE REACT
+// RUTAS API REST SINCRONIZADAS
 app.get('/api/cards', (req, res) => res.json(cards));
 
-app.post('/api/cards', (req, res) => {
-  const { id, owner } = req.body;
-  if (!id || !owner) return res.status(400).json({ error: 'Faltan datos' });
-
-  const cleanId = id.toUpperCase().trim();
-  const existingCard = cards.find(c => c.id === cleanId);
-
-  if (existingCard) {
-    existingCard.owner = owner;
-  } else {
-    cards.push({ id: cleanId, owner, isPaid: true, active: true, cardCode: `CARD_${cleanId.substring(0, 4)}` });
-  }
-
-  io.emit('update_cards', cards);
-  res.json({ success: true, cards });
-});
-
+// CAMBIAR PAGO / MOROSIDAD
 app.put('/api/cards/:id/membership', (req, res) => {
   const { id } = req.params;
   const { isPaid } = req.body;
-  cards = cards.map(c => c.id.toUpperCase() === id.toUpperCase() ? { ...c, isPaid } : c);
+  const cleanId = id.toUpperCase().trim();
+  
+  cards = cards.map(c => c.id.toUpperCase().trim() === cleanId ? { ...c, isPaid: Boolean(isPaid) } : c);
+  addLog('INFO', `Estado de pago de ${cleanId} actualizado a ${isPaid ? 'PAGADO' : 'MOROSO'}`);
+  
   io.emit('update_cards', cards);
   res.json({ success: true, cards });
 });
 
+// CAMBIAR ESTADO ACTIVO / INACTIVO
 app.put('/api/cards/:id', (req, res) => {
   const { id } = req.params;
   const { active } = req.body;
-  cards = cards.map(c => c.id.toUpperCase() === id.toUpperCase() ? { ...c, active } : c);
+  const cleanId = id.toUpperCase().trim();
+
+  cards = cards.map(c => c.id.toUpperCase().trim() === cleanId ? { ...c, active: Boolean(active) } : c);
+  addLog('INFO', `Estado de tarjeta ${cleanId} actualizado a ${active ? 'HABILITADA' : 'DESACTIVADA'}`);
+
   io.emit('update_cards', cards);
   res.json({ success: true, cards });
 });
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`🚀 Backend corriendo en puerto ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Servidor backend en puerto ${PORT}`));
