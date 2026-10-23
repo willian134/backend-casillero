@@ -6,7 +6,7 @@ import cors from 'cors';
 const app = express();
 const server = http.createServer(app);
 
-// CONFIGURACIÓN DE SOCKET.IO CON CORS ABIERTO Y POLING DE RESPALDO
+// CONFIGURACIÓN DE SOCKET.IO CON CORS ABIERTO Y POLLING DE RESPALDO
 const io = new Server(server, {
   cors: {
     origin: '*',
@@ -83,12 +83,20 @@ io.on('connection', (socket) => {
 // RECEPTOR DE WEBHOOKS (ESP32)
 // ==========================================
 app.post('/api/webhook', (req, res) => {
-  const { event, tipo_evento, cardId, uid, valor } = req.body;
+  const { event, tipo_evento, cardId, uid, valor, distance, occupied } = req.body;
   const rawUid = cardId || uid || valor || '';
   const idTarjeta = rawUid.toString().toUpperCase().trim();
   const eventType = event || tipo_evento;
 
-  // 🚨 1. ALERTA DE FORCEJEO / VIBRACIÓN (SENSOR SW-420)
+  // 📡 1. TRANSMISIÓN DE TELEMETRÍA ULTRASÓNICA AL FRONTEND (HC-SR04)
+  if (distance !== undefined || occupied !== undefined) {
+    io.emit('telemetry_update', {
+      distance: distance !== undefined ? parseFloat(distance) : 999,
+      occupied: Boolean(occupied)
+    });
+  }
+
+  // 🚨 2. ALERTA DE FORCEJEO / VIBRACIÓN (SENSOR SW-420)
   if (eventType === 'DOOR_FORCED') {
     console.log("🚨 [ALERTA DE SEGURIDAD] Impacto detectado por SW-420 en la puerta");
     
@@ -100,7 +108,7 @@ app.post('/api/webhook', (req, res) => {
     return res.json({ action: 'ALARM_ACKNOWLEDGED', buzzer: true });
   }
 
-  // 💳 2. ESCANEO DE TARJETA RFID (RC522)
+  // 💳 3. ESCANEO DE TARJETA RFID (RC522)
   if (eventType === 'RFID_SCAN' || eventType === 'rfid_lectura') {
     const card = cards.find(c => c.id.toUpperCase().trim() === idTarjeta);
 
